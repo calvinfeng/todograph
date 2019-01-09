@@ -24,6 +24,7 @@ func NewWait(t *Todo) *Wait {
 	}
 }
 
+// Wait is a staging area for nodes to wait for dependency resolution.
 type Wait struct {
 	graph     DirectedGraph
 	loaded    bool
@@ -32,8 +33,15 @@ type Wait struct {
 	next      chan NodeID
 }
 
-func (w *Wait) NextNode() graph.Node {
-	return nil
+// NextNode returns the next ready node.
+func (w *Wait) NextNode() <-chan graph.Node {
+	ch := make(chan graph.Node)
+	go func() {
+		id := <-w.next
+		ch <- w.graph.Node(int64(id))
+	}()
+
+	return ch
 }
 
 // Load configures goroutines to listen for each operation outcome (success/failure) and demultiplex
@@ -78,16 +86,14 @@ func (w *Wait) Load() error {
 	return nil
 }
 
-func (w *Wait) Stage(parent context.Context) error {
+// Stage puts every node onto the stage and set them to wait state.
+func (w *Wait) Stage(ctx context.Context) error {
 	if !w.loaded {
 		return errors.New("wait area is not loaded")
 	}
 
 	queue := w.graph.Sources()
 	visited := make(map[int64]struct{})
-
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
 
 	for len(queue) > 0 {
 		current := queue[0]
@@ -133,15 +139,16 @@ func (w *Wait) stageNode(ctx context.Context, n graph.Node) error {
 
 	switch op.ConnectorType() {
 	case And:
-		go w.fanInAnd(ctx, NodeID(op.ID()), deps)
+		go w.andGate(ctx, NodeID(op.ID()), deps)
 	case Or:
-		go w.fanInOr(ctx, NodeID(op.ID()), deps)
+		go w.orGate(ctx, NodeID(op.ID()), deps)
 	}
 
 	return nil
 }
 
-func (w *Wait) fanInAnd(ctx context.Context, id NodeID, deps []<-chan NodeID) {
+// andGate is equivalent to fan-in-and logic.
+func (w *Wait) andGate(ctx context.Context, id NodeID, deps []<-chan NodeID) {
 	out := fanIn(ctx, deps...)
 	for i := 0; i < len(deps); i++ {
 		<-out
@@ -150,7 +157,8 @@ func (w *Wait) fanInAnd(ctx context.Context, id NodeID, deps []<-chan NodeID) {
 	w.next <- id
 }
 
-func (w *Wait) fanInOr(ctx context.Context, id NodeID, deps []<-chan NodeID) {
+// orGate is equivalent to fan-in-or logic.
+func (w *Wait) orGate(ctx context.Context, id NodeID, deps []<-chan NodeID) {
 	out := fanIn(ctx, deps...)
 	for i := 0; i < len(deps); i++ {
 		<-out
