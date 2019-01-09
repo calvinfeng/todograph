@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -23,19 +24,24 @@ func main() {
 	t.AddRelation(n1, n3)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	wait := NewWait(t)
-	wait.Load()
+	wait.Load(ctx)
 	wait.Stage(ctx)
+
+Loop:
 	for {
-		timeout := time.After(5 * time.Second)
+		timeout := time.After(1 * time.Second)
 		select {
 		case n := <-wait.NextNode():
 			op := n.(Operation)
 			go op.Run()
 		case <-timeout:
-			return
+			cancel()
+			fmt.Println("canceling")
+			break Loop
 		}
 	}
+
+	time.Sleep(5 * time.Second)
 }

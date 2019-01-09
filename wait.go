@@ -8,12 +8,14 @@ import (
 	"gonum.org/v1/gonum/graph"
 )
 
+// DirectedGraph built on top of graph.
 type DirectedGraph interface {
 	graph.Graph
 	To(id int64) graph.Nodes
 	Sources() []graph.Node
 }
 
+// NewWait returns a wait.
 func NewWait(t *Todo) *Wait {
 	return &Wait{
 		graph:     t,
@@ -46,39 +48,26 @@ func (w *Wait) NextNode() <-chan graph.Node {
 
 // Load configures goroutines to listen for each operation outcome (success/failure) and demultiplex
 // the result into multiple copies to fulfill the needs of each node's dependents.
-func (w *Wait) Load() error {
+func (w *Wait) Load(ctx context.Context) error {
 	nodes := w.graph.Nodes()
 	for nodes.Next() {
-		n := nodes.Node()
-		op, ok := n.(Operation)
+		node := nodes.Node()
+		op, ok := node.(Operation)
 		if !ok {
-			return fmt.Errorf("node %d does not implement Operation interface", n.ID())
+			return fmt.Errorf("node %d does not implement Operation interface", node.ID())
 		}
 
 		w.successes[op.ID()] = make(chan NodeID)
 		w.failures[op.ID()] = make(chan NodeID)
 
-		demux := func(n int, succ, fail <-chan NodeID, succOut, failOut chan<- NodeID) {
-			var id NodeID
-			var out chan<- NodeID
-			select {
-			case id = <-succ:
-				out = succOut
-			case id = <-fail:
-				out = failOut
-			}
-
-			for i := 0; i < n; i++ {
-				out <- id
-			}
-		}
+		// Number of children/dependents
+		n := w.graph.From(op.ID()).Len()
 
 		// Setup demultiplexing structure to wait for op's result. Why do we need demux? Every
 		// operation has one result, either success or failure. Each operation may have multiple
 		// dependents. The one result needs to be demultiplexed into multiple ones to make sure each
 		// dependent receives one copy.
-		go demux(w.graph.From(op.ID()).Len(), op.Success(), op.Failure(),
-			w.successes[op.ID()], w.failures[op.ID()])
+		go demux(ctx, n, op.Success(), op.Failure(), w.successes[op.ID()], w.failures[op.ID()])
 	}
 
 	w.loaded = true
@@ -151,7 +140,12 @@ func (w *Wait) stageNode(ctx context.Context, n graph.Node) error {
 func (w *Wait) andGate(ctx context.Context, id NodeID, deps []<-chan NodeID) {
 	out := fanIn(ctx, deps...)
 	for i := 0; i < len(deps); i++ {
-		<-out
+		select {
+		case <-ctx.Done():
+			fmt.Println("killed and-gate")
+			return
+		case <-out:
+		}
 	}
 
 	w.next <- id
@@ -161,9 +155,14 @@ func (w *Wait) andGate(ctx context.Context, id NodeID, deps []<-chan NodeID) {
 func (w *Wait) orGate(ctx context.Context, id NodeID, deps []<-chan NodeID) {
 	out := fanIn(ctx, deps...)
 	for i := 0; i < len(deps); i++ {
-		<-out
-		w.next <- id
-		return
+		select {
+		case <-ctx.Done():
+			fmt.Println("killed or-gate")
+			return
+		case <-out:
+			w.next <- id
+			return
+		}
 	}
 }
 
@@ -175,6 +174,7 @@ func fanIn(ctx context.Context, inputs ...<-chan NodeID) <-chan NodeID {
 		go func(ch <-chan NodeID) {
 			select {
 			case <-ctx.Done():
+				fmt.Println("killed fan-in")
 				return
 			case out <- <-ch:
 			}
@@ -182,4 +182,24 @@ func fanIn(ctx context.Context, inputs ...<-chan NodeID) <-chan NodeID {
 	}
 
 	return out
+}
+
+func demux(ctx context.Context, n int, succ, fail <-chan NodeID, succOut, failOut chan<- NodeID) {
+	var id NodeID
+	var out chan<- NodeID
+	select {
+	case id = <-succ:
+		out = succOut
+	case id = <-fail:
+		out = failOut
+	}
+
+	for i := 0; i < n; i++ {
+		select {
+		case <-ctx.Done():
+			fmt.Println("killed demux")
+			return
+		case out <- id:
+		}
+	}
 }
